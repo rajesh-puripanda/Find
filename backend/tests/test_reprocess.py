@@ -92,11 +92,28 @@ def _fresh_db():
 # Patch find_api.routers.gallery.Media so the router uses our FakeMedia.
 # ---------------------------------------------------------------------------
 
+_ORIGINAL_GALLERY_MEDIA = gallery_module.Media
 gallery_module.Media = FakeMedia  # type: ignore[assignment]
 
 test_app = FastAPI()
 test_app.include_router(gallery_module.router, prefix="/api")
 test_app.dependency_overrides[get_db] = get_test_db
+# Gallery endpoints now depend on get_required_user; this minimal test app
+# has no users table, so force local (single-user) mode by returning None.
+from find_api.core.dependencies import get_required_user  # noqa: E402
+
+test_app.dependency_overrides[get_required_user] = lambda: None
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _restore_gallery_media():
+    """Undo the module-level gallery_module.Media monkeypatch after this module.
+
+    Without this the FakeMedia patch leaks into other test modules (e.g. the
+    shared-mode scoping tests) that use the real gallery router.
+    """
+    yield
+    gallery_module.Media = _ORIGINAL_GALLERY_MEDIA
 
 
 @pytest.fixture(autouse=True)
@@ -278,6 +295,34 @@ class TestReprocessEndpoint:
 
         assert call_args[0][0] is analyze_image
         assert call_args[0][1] == media.id
+        assert call_args[0][2] is True
+
+    @patch("find_api.routers.gallery.get_task_queue")
+    def test_reprocess_requests_model_failure_clear(self, mock_queue, client):
+        """Retrying analysis must let the worker reload previously failed models."""
+        mock_job = MagicMock()
+        mock_job.id = "fake-job-clear-model-state"
+        mock_queue.return_value.enqueue.return_value = mock_job
+
+        media = make_media(
+            status="indexed",
+            metadata_json={
+                "caption": "",
+                "stage_status": {
+                    "captioning": {
+                        "status": "failed",
+                        "error": "ModelUnavailableError",
+                    }
+                },
+            },
+        )
+
+        resp = client.post(f"/api/image/{media.id}/reprocess")
+
+        assert resp.status_code == 200
+        mock_queue.return_value.enqueue.assert_called_once()
+        call_args = mock_queue.return_value.enqueue.call_args
+        assert call_args[0][2] is True
 
     @patch("find_api.routers.gallery.get_task_queue")
     def test_repeated_reprocess_allowed(self, mock_queue, client):

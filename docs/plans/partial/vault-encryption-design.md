@@ -2,9 +2,9 @@
 
 - **Status:** Partially complete
 - **Date:** 2026-05-21
-- **Last reviewed:** 2026-05-28
+- **Last reviewed:** 2026-05-29
 - **Related:** Issue #183
-- **Current implementation status:** Vault unlock, hide, list, lock, and stream flows exist with encrypted blob storage and tests. The implementation does not fully match this design note yet: it uses AES-GCM instead of the documented ChaCha20-Poly1305 decision, does not bind AEAD associated data to `media_id`/`file_hash`, and should be reviewed against the metadata/vector exclusion requirements before this plan is marked complete.
+- **Current implementation status:** Vault unlock, hide, list, lock, and stream flows exist with AES-256-GCM encrypted blob storage, metadata-bound AEAD associated data, and tests. Hidden media is filtered from gallery, search, clusters, and people endpoints, and workers skip ML processing for hidden rows.
 
 ## Problem
 
@@ -61,12 +61,15 @@ records and having them still verify successfully.
 | Nonce length | 96-bit (12 bytes) | 96-bit (12 bytes) |
 | Authentication tag | 128-bit | 128-bit |
 
-**Decision: ChaCha20-Poly1305.**
+**Decision: AES-256-GCM for the current implementation.**
 
-Find targets a local-first desktop app running on end-user hardware. Hardware AES acceleration is
-not guaranteed across all supported machines. ChaCha20-Poly1305 is constant-time in software,
-which removes a whole class of timing-side-channel risk without requiring anything beyond the
-`cryptography` package already usable in the backend.
+Find currently encrypts vault blobs through streaming file helpers so large images do not need to
+be loaded fully into API worker memory before encryption or decryption. `cryptography` exposes the
+low-level AES-GCM streaming interface used by the implementation, while still providing AEAD
+integrity and associated-data authentication. ChaCha20-Poly1305 remains an acceptable future
+option if the project later moves to an all-in-memory blob boundary or adds a reviewed streaming
+construction, but the design and tests now treat AES-256-GCM with mandatory AAD as the active
+contract.
 
 ## Key derivation
 
@@ -99,7 +102,8 @@ memory for the duration of an unlock session.
 
 - The raw image bytes (the blob stored in MinIO or the local filesystem).
 - Each blob is encrypted independently with a fresh random 96-bit nonce.
-- The stored format per file is: `nonce (12 bytes) || ciphertext || tag (16 bytes)`.
+- The stored format per file is: `ciphertext || tag (16 bytes)`. The 96-bit nonce/IV is stored in
+  the `vault_metadata.iv` column for the same `media_id`.
 - AEAD **must** also authenticate Associated Data (AAD) that is not stored inside the
   ciphertext, so that a valid encrypted blob cannot be swapped onto a different media record.
 - The AAD for each blob must be the exact UTF-8 string:
@@ -184,7 +188,7 @@ This note is research only. A follow-up implementation issue should cover:
 
 ## Decision
 
-- **Cipher:** ChaCha20-Poly1305
+- **Cipher:** AES-256-GCM
 - **KDF:** Argon2id with OWASP 2024 baseline parameters
 - **Key lifetime:** In-memory only; never persisted
 - **Encryption scope:** Raw image blobs only; all ML-derived fields (`vector`, `metadata_json`,
@@ -205,3 +209,33 @@ This note is research only. A follow-up implementation issue should cover:
   - `backend/src/find_api/routers/gallery.py`
   - `docs/plans/partial/local-first-roadmap.md`
   - `docs/plans/not-started/storage-provider-neutrality-adr.md`
+
+## Tamper-Case Test Plan
+
+These cases should become focused backend tests when vault encryption is hardened. Each test can use
+small byte strings instead of real images.
+
+| Case | Setup | Action | Expected result |
+| --- | --- | --- | --- |
+| Happy path | Encrypt bytes for a media record with the correct passphrase and AAD built from `vault:v1`, `media_id`, and `file_hash`. | Decrypt with the same passphrase and reconstructed AAD. | Decryption succeeds and returns the original bytes. |
+| Wrong passphrase | Encrypt bytes with a known passphrase. | Attempt unlock/decryption with a different passphrase. | Decryption or unlock fails; no partial plaintext is returned. |
+| Tampered ciphertext | Encrypt bytes, then flip one byte in the ciphertext or tag. | Attempt to decrypt the modified blob with the correct passphrase and AAD. | AEAD authentication fails; no plaintext is returned. |
+| Tampered metadata / AAD | Encrypt bytes for media record A using AAD from record A. | Attempt to decrypt using changed AAD, such as a different `media_id` or `file_hash`. | AEAD authentication fails because the trusted metadata no longer matches the blob. |
+| Swapped encrypted blob | Encrypt two blobs for two different media records with the same vault key. | Swap the encrypted blob, nonce, or metadata reference so record A attempts to serve record B's blob. | Decryption for record A fails because the AAD is bound to record A's `media_id` and `file_hash`; no unrelated vault data is exposed. |
+
+## Current vs Desired Hardened Behavior
+
+### Current Behavior
+
+- The current implementation uses AES-GCM and verifies ciphertext integrity before streaming
+  decrypted bytes.
+- Wrong passphrase and raw ciphertext/tag tampering are covered by the existing authentication
+  checks.
+- The encrypted blob is not yet authenticated against `media_id` and `file_hash` as AEAD
+  associated data, so a record-level swap is the gap this plan is meant to drive into tests.
+
+### Desired Hardened Behavior
+
+- All tampered or swapped blobs should fail authentication consistently.
+- No partial plaintext should ever be exposed.
+- Errors should avoid leaking sensitive implementation details.

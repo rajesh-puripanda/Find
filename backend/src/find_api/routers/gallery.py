@@ -14,10 +14,17 @@ from sqlalchemy.orm import Session
 
 from find_api.core.config import settings
 from find_api.core.database import get_db
+from find_api.core.dependencies import (
+    can_access_media,
+    get_required_user,
+    scope_media_query,
+)
 from find_api.core.queue import get_task_queue
 from find_api.core.storage import get_file_url, delete_file
 from find_api.models.media import Media
 from find_api.models.cluster import Cluster
+from find_api.models.user import User
+from find_api.services.query_cache import invalidate_query_cache
 from find_api.workers.jobs import analyze_image, generate_thumbnail_for_media
 
 logger = logging.getLogger(__name__)
@@ -45,6 +52,15 @@ class BulkDeleteResponse(BaseModel):
     failed_count: int
 
 
+class GalleryCountsResponse(BaseModel):
+    """Status counts for the visible gallery tabs."""
+
+    all: int
+    indexed: int
+    processing: int
+    failed: int
+
+
 def build_thumbnail_url(media_id: int) -> str:
     """Return the API route that serves the best available thumbnail."""
     return f"/api/image/{media_id}/thumbnail"
@@ -62,6 +78,35 @@ def normalize_metadata(value):
     return {}
 
 
+def _public_media_query(db: Session):
+    return db.query(Media).filter(Media.is_hidden.is_(False))
+
+
+def _load_public_media_or_404(db: Session, media_id: int) -> Media:
+    media = _public_media_query(db).filter(Media.id == media_id).first()
+    if not media:
+        raise HTTPException(404, "Image not found")
+    return media
+
+
+@router.get("/gallery/counts", response_model=GalleryCountsResponse)
+def get_gallery_counts(
+    liked: Optional[bool] = None,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_required_user),
+):
+    query = scope_media_query(db.query(Media).filter(Media.is_hidden.is_(False)), user)
+    if liked is not None:
+        query = query.filter(Media.liked == liked)
+
+    return GalleryCountsResponse(
+        all=query.count(),
+        indexed=query.filter(Media.status == "indexed").count(),
+        processing=query.filter(Media.status == "processing").count(),
+        failed=query.filter(Media.status == "failed").count(),
+    )
+
+
 @router.get("/gallery")
 def get_gallery(
     skip: int = Query(0, ge=0),
@@ -72,6 +117,7 @@ def get_gallery(
     ),
     liked: Optional[bool] = None,
     db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_required_user),
 ):
     """
     Get paginated list of images
@@ -85,7 +131,7 @@ def get_gallery(
         Paginated list of media records
     """
     # Build query
-    query = db.query(Media).filter(Media.is_hidden.is_(False))
+    query = scope_media_query(_public_media_query(db), user)
 
     if status:
         query = query.filter(Media.status == status)
@@ -149,7 +195,11 @@ def get_gallery(
 
 
 @router.get("/image/{media_id}")
-def get_image_detail(media_id: int, db: Session = Depends(get_db)):
+def get_image_detail(
+    media_id: int,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_required_user),
+):
     """
     Get detailed information about a specific image
 
@@ -162,7 +212,7 @@ def get_image_detail(media_id: int, db: Session = Depends(get_db)):
     row = (
         db.query(Media, Cluster.label)
         .outerjoin(Cluster, Media.cluster_id == Cluster.id)
-        .filter(Media.id == media_id)
+        .filter(Media.id == media_id, Media.is_hidden.is_(False))
         .first()
     )
 
@@ -170,6 +220,8 @@ def get_image_detail(media_id: int, db: Session = Depends(get_db)):
         raise HTTPException(404, "Image not found")
 
     media, cluster_label = row
+    if not can_access_media(media, user):
+        raise HTTPException(404, "Image not found")
     metadata = normalize_metadata(media.metadata_json)
 
     # Build response
@@ -212,13 +264,17 @@ def get_image_detail(media_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/image/{media_id}/thumbnail")
-def get_image_thumbnail(media_id: int, db: Session = Depends(get_db)):
+def get_image_thumbnail(
+    media_id: int,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_required_user),
+):
     """
     Get a redirect to the image file for use as a thumbnail.
     Returns a redirect to the MinIO presigned URL.
     """
-    media = db.query(Media).filter(Media.id == media_id).first()
-    if not media:
+    media = _load_public_media_or_404(db, media_id)
+    if not can_access_media(media, user):
         raise HTTPException(404, "Image not found")
 
     object_key = media.thumbnail_key or media.minio_key
@@ -235,6 +291,7 @@ def get_image_thumbnail(media_id: int, db: Session = Depends(get_db)):
 def backfill_missing_thumbnails(
     limit: int = Query(100, ge=1, le=1000),
     db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_required_user),
 ):
     """
     Enqueue thumbnail-only jobs for existing images that do not have thumbnails.
@@ -244,8 +301,9 @@ def backfill_missing_thumbnails(
     clustering.
     """
     media_list = (
-        db.query(Media)
-        .filter(Media.thumbnail_key.is_(None))
+        scope_media_query(
+            _public_media_query(db).filter(Media.thumbnail_key.is_(None)), user
+        )
         .order_by(desc(Media.created_at))
         .limit(limit)
         .all()
@@ -270,13 +328,13 @@ def backfill_missing_thumbnails(
         )
         job_ids.append(job.id)
 
-    remaining = (
-        db.query(Media)
-        .filter(
-            Media.thumbnail_key.is_(None), Media.id.notin_([m.id for m in media_list])
-        )
-        .count()
-    )
+    remaining = scope_media_query(
+        _public_media_query(db).filter(
+            Media.thumbnail_key.is_(None),
+            Media.id.notin_([m.id for m in media_list]),
+        ),
+        user,
+    ).count()
 
     return {
         "queued": len(job_ids),
@@ -287,20 +345,29 @@ def backfill_missing_thumbnails(
 
 
 @router.post("/image/{media_id}/like")
-def toggle_like(media_id: int, db: Session = Depends(get_db)):
-    media = db.query(Media).filter(Media.id == media_id).first()
-    if not media:
+def toggle_like(
+    media_id: int,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_required_user),
+):
+    media = _load_public_media_or_404(db, media_id)
+    if not can_access_media(media, user):
         raise HTTPException(404, "Image not found")
 
     media.liked = not media.liked
     db.commit()
+    invalidate_query_cache()
     db.refresh(media)
 
     return {"id": media.id, "liked": media.liked}
 
 
 @router.post("/image/{media_id}/reprocess")
-def reprocess_image(media_id: int, db: Session = Depends(get_db)):
+def reprocess_image(
+    media_id: int,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_required_user),
+):
     """
     Reset a media record to pending and re-enqueue analysis.
 
@@ -309,8 +376,8 @@ def reprocess_image(media_id: int, db: Session = Depends(get_db)):
     - Images with status ``indexed`` that have incomplete metadata (no caption)
     - Images with status ``indexed`` that are missing a thumbnail
     """
-    media = db.query(Media).filter(Media.id == media_id).first()
-    if not media:
+    media = _load_public_media_or_404(db, media_id)
+    if not can_access_media(media, user):
         raise HTTPException(404, "Image not found")
 
     metadata = normalize_metadata(media.metadata_json)
@@ -334,10 +401,14 @@ def reprocess_image(media_id: int, db: Session = Depends(get_db)):
 
     try:
         job = get_task_queue().enqueue(
-            analyze_image, media.id, job_timeout=settings.WORKER_TIMEOUT
+            analyze_image,
+            media.id,
+            True,
+            job_timeout=settings.WORKER_TIMEOUT,
         )
         media.analysis_job_id = job.id
         db.commit()
+        invalidate_query_cache()
     except Exception as exc:  # noqa: BLE001
         db.rollback()
         raise HTTPException(
@@ -387,9 +458,13 @@ def _delete_media_files(media: Media) -> None:
 
 
 @router.delete("/image/{media_id}")
-def delete_image(media_id: int, db: Session = Depends(get_db)):
-    media = db.query(Media).filter(Media.id == media_id).first()
-    if not media:
+def delete_image(
+    media_id: int,
+    db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_required_user),
+):
+    media = _load_public_media_or_404(db, media_id)
+    if not can_access_media(media, user):
         raise HTTPException(404, "Image not found")
 
     try:
@@ -403,6 +478,7 @@ def delete_image(media_id: int, db: Session = Depends(get_db)):
     _remove_media_ids_from_clusters(db, {media_id})
 
     db.commit()
+    invalidate_query_cache()
 
     return {"message": "Image deleted", "id": media_id}
 
@@ -411,9 +487,12 @@ def delete_image(media_id: int, db: Session = Depends(get_db)):
 def bulk_delete_images(
     request: BulkDeleteRequest,
     db: Session = Depends(get_db),
+    user: Optional[User] = Depends(get_required_user),
 ):
     requested_ids = list(dict.fromkeys(request.media_ids))
-    media_rows = db.query(Media).filter(Media.id.in_(requested_ids)).all()
+    media_rows = scope_media_query(
+        _public_media_query(db).filter(Media.id.in_(requested_ids)), user
+    ).all()
     media_by_id = {media.id: media for media in media_rows}
     missing_ids = [
         media_id for media_id in requested_ids if media_id not in media_by_id
@@ -443,6 +522,8 @@ def bulk_delete_images(
         _remove_media_ids_from_clusters(db, set(deleted_ids))
 
     db.commit()
+    if deleted_ids:
+        invalidate_query_cache()
 
     return {
         "message": "Bulk delete completed",
